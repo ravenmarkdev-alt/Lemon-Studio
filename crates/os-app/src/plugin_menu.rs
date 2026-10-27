@@ -4,16 +4,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // This file is part of Lemon Studio: https://github.com/ItsAlphaNeon/Lemon-Studio
 
-//! Plugin menus (the full-screen plugin picker is retired): F8, the toolbar's plugin button, the channel rack's "+",
-//! Add one ▸ / Insert ▸ and the mixer slots open the app's own popup listing the installed plugins, and a pick adds
-//! the plugin where that menu says.
+//! Plugin menus: F8, the toolbar's plugin button, the channel rack's "+" and an empty mixer slot open the plugin
+//! picker (`crate::plugin_picker`); Add one ▸ / Insert ▸ / Replace ▸ and ADD ▸ Effect list the installed plugins as
+//! submenus. A pick adds the plugin where that menu says. Each plugin family is listed once (`plugin_db::families`).
 // spec: ui/plugin-menu.md
 
 use std::collections::BTreeMap;
 
 use crate::app::{App, State};
-use crate::playlist::{Cmd, Mark, PItem, Popup};
-use crate::plugin_db::{self as db, Entry, MenuView, Mode};
+use crate::playlist::{Cmd, Mark, PItem};
+use crate::plugin_db::{self as db, Family, MenuView, Mode};
 
 /// What a plugin menu entry does (`Cmd::Plugin`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -47,7 +47,8 @@ pub enum Target {
     Fx(Option<u8>),
 }
 
-fn pick(target: Target, effect: bool, index: usize) -> Cmd {
+/// What picking plugin `index` (an effect when `effect`) in `target`'s menu does.
+pub(crate) fn pick(target: Target, effect: bool, index: usize) -> Cmd {
     Cmd::Plugin(match (target, effect) {
         (Target::Fx(slot), _) => PlugCmd::Effect { index, slot },
         (_, true) => PlugCmd::Effect { index, slot: None },
@@ -57,8 +58,9 @@ fn pick(target: Target, effect: bool, index: usize) -> Cmd {
     })
 }
 
-fn item(e: &Entry, target: Target, effect: bool) -> PItem {
-    PItem::new(e.label.clone(), pick(target, effect, e.index))
+/// A family's entry: its name, adding the variant a click adds.
+fn item(f: &Family, target: Target) -> PItem {
+    PItem::new(f.name.clone(), pick(target, f.effect, f.entry().index))
 }
 
 /// A header with a run-time label.
@@ -66,41 +68,74 @@ fn head(label: String) -> PItem {
     PItem { head: true, ..PItem::new(label, Cmd::Nothing) }
 }
 
-/// One section's entries (spec §2): favourites, a separator, then the rest by display mode. `nested`: the list is a
-/// submenu itself, so "By vendor" uses headers instead of submenus (popups open one submenu level).
+/// How many plugins a menu's Recent lists.
+pub(crate) const RECENT_SHOWN: usize = 5;
+
+/// The families of `fams` among the plugins added last (`Prefs::recent`), newest first.
+pub(crate) fn recent<'a>(s: &State, fams: &'a [Family]) -> Vec<&'a Family> {
+    let at = |f: &Family| f.variants.iter().filter_map(|e| s.plugdb.prefs.recent.iter().position(|u| *u == e.uid)).min();
+    let mut v: Vec<&Family> = fams.iter().filter(|f| at(f).is_some()).collect();
+    v.sort_by_key(|f| at(f));
+    v.truncate(RECENT_SHOWN);
+    v
+}
+
+/// One section's entries (spec §2): favourites, the plugins added last, then every plugin by display mode; under
+/// Categories, a submenu per category. `nested`: the list is a submenu itself, so categories and vendors use headers
+/// instead of submenus (popups open one submenu level).
 fn section(s: &State, effect: bool, target: Target, nested: bool) -> Vec<PItem> {
     let list = if effect { &s.plugdb.lists.fx } else { &s.plugdb.lists.gens };
     if list.is_empty() {
         return vec![PItem::new(if effect { "(no effect plugins found)" } else { "(no instruments found)" }, Cmd::Nothing).off()];
     }
-    let mut v: Vec<PItem> = list.iter().filter(|e| e.favorite).map(|e| item(e, target, effect)).collect();
-    let rest: Vec<&Entry> = list.iter().filter(|e| !e.favorite).collect();
-    if !v.is_empty() && !rest.is_empty() {
-        v.push(PItem::sep());
+    let fams = db::families(list, effect);
+    let mut v = Vec::new();
+    let favs: Vec<PItem> = fams.iter().filter(|f| f.favorite()).map(|f| item(f, target)).collect();
+    if !favs.is_empty() {
+        v.push(PItem::head("Favorites"));
+        v.extend(favs);
+    }
+    let recent = recent(s, &fams);
+    if !recent.is_empty() {
+        v.push(PItem::head("Recent"));
+        v.extend(recent.into_iter().map(|f| item(f, target)));
     }
     match s.plugdb.prefs.menu_view {
-        MenuView::Simple => v.extend(rest.iter().map(|e| item(e, target, effect))),
+        MenuView::Simple => {
+            if !v.is_empty() {
+                v.push(PItem::head("All"));
+            }
+            v.extend(fams.iter().map(|f| item(f, target)));
+        }
         MenuView::Categories => {
+            if !nested {
+                v.push(PItem::head("Categories"));
+            }
             for cat in db::categories(effect) {
-                let in_cat: Vec<&&Entry> = rest.iter().filter(|e| e.category == cat).collect();
-                if !in_cat.is_empty() {
+                let items: Vec<PItem> = fams.iter().filter(|f| f.category == cat).map(|f| item(f, target)).collect();
+                if items.is_empty() {
+                    continue;
+                }
+                if nested {
                     v.push(PItem::head(cat));
-                    v.extend(in_cat.iter().map(|e| item(e, target, effect)));
+                    v.extend(items);
+                } else {
+                    v.push(PItem::sub(format!("{cat} ({})", items.len()), items));
                 }
             }
         }
         MenuView::Vendor => {
-            let mut by: BTreeMap<String, (String, Vec<&Entry>)> = BTreeMap::new();
-            for e in &rest {
-                by.entry(e.vendor.to_lowercase()).or_insert_with(|| (e.vendor.clone(), Vec::new())).1.push(e);
+            let mut by: BTreeMap<String, (String, Vec<&Family>)> = BTreeMap::new();
+            for f in &fams {
+                by.entry(f.vendor.to_lowercase()).or_insert_with(|| (f.vendor.clone(), Vec::new())).1.push(f);
             }
-            for (_, (vendor, es)) in by {
-                let items: Vec<PItem> = es.iter().map(|e| item(e, target, effect)).collect();
+            for (_, (vendor, fs)) in by {
+                let items: Vec<PItem> = fs.iter().map(|f| item(f, target)).collect();
                 if nested {
                     v.push(head(vendor));
                     v.extend(items);
                 } else {
-                    v.push(PItem { children: items, ..PItem::new(vendor, Cmd::Nothing) });
+                    v.push(PItem::sub(vendor, items));
                 }
             }
         }
@@ -139,31 +174,25 @@ pub fn items(s: &State, target: Target, nested: bool) -> Vec<PItem> {
     v
 }
 
-/// A plugin menu for `target` at (x, y).
-pub fn menu(s: &State, target: Target, x: f32, y: f32) -> Popup {
-    Popup { x, y, items: items(s, target, false), sub: None, scroll: [0; 2] }
-}
-
-/// Whether the open popup is a plugin menu (F8 closes it).
+/// Whether the plugin picker is open (F8 closes it).
 pub fn is_open(s: &State) -> bool {
-    s.playlist.popup.as_ref().is_some_and(|p| p.items.iter().any(|i| i.cmd == Cmd::Plugin(PlugCmd::Manage)))
+    s.picker.is_some()
 }
 
 impl App {
-    /// Opens the plugin menu for `target` at (x, y); F8 while one is open closes it.
-    pub fn open_plugin_menu(&mut self, target: Target, at: (f32, f32)) {
-        self.state.menu_open = None;
-        self.state.playlist.popup = Some(menu(&self.state, target, at.0, at.1));
-        self.invalidate();
+    /// Opens the plugin picker for `target` in the middle of the window (`crate::plugin_picker`); `_at` is where the
+    /// way in was (the picker does not follow it).
+    pub fn open_plugin_menu(&mut self, target: Target, _at: (f32, f32)) {
+        self.open_picker(target);
     }
 
-    /// F8 (spec §1): the all-plugins menu at the mouse, or closes an open plugin menu.
+    /// F8 (spec §1): the plugin picker for every plugin, or closes an open one.
     pub fn toggle_plugin_menu(&mut self) {
         if is_open(&self.state) {
-            self.state.playlist.popup = None;
+            self.state.picker = None;
             self.invalidate();
         } else {
-            self.open_plugin_menu(Target::All, self.mouse);
+            self.open_picker(Target::All);
         }
     }
 }
@@ -312,5 +341,29 @@ pub fn add_effect(app: &mut App, index: usize, slot: Option<u8>) -> Option<Strin
             crate::mixer::run(app, crate::mixer::MCmd::AddEffect(k, index))
         }
         None => Some("Every slot of this track is in use".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A submenu (Replace ▸, ADD ▸ Effect) lists each family once under its category's header, favourites and the
+    /// plugins added last above them; it has no submenus of its own.
+    #[test]
+    fn submenus_list_families_by_category() {
+        let mut app = App::new(None);
+        app.plugins.available.clear();
+        app.plugins.effects = ["CLA-76 Mono", "CLA-76 Stereo", "Echo Thing"].iter().map(|n| db::fake(n, os_host::Kind::Effect)).collect();
+        app.state.plugdb.prefs.toggle_favorite(&app.plugins.effects[2].desc.uid());
+        app.state.plugdb.prefs.note_recent(&app.plugins.effects[0].desc.uid());
+        app.state.plugdb.rebuild(&app.plugins);
+        let v = items(&app.state, Target::Fx(Some(2)), true);
+        assert!(v.iter().all(|it| it.children.is_empty()));
+        let heads: Vec<&str> = v.iter().filter(|it| it.head).map(|it| it.label.as_ref()).collect();
+        assert_eq!(heads, ["Favorites", "Recent", "Other"]);
+        let names: Vec<&str> = v.iter().filter(|it| matches!(it.cmd, Cmd::Plugin(PlugCmd::Effect { .. }))).map(|it| it.label.as_ref()).collect();
+        assert_eq!(names, ["Echo Thing", "CLA-76", "CLA-76", "Echo Thing"]);
+        assert!(v.iter().any(|it| it.cmd == Cmd::Plugin(PlugCmd::Effect { index: 1, slot: Some(2) })), "CLA-76 adds its stereo variant");
     }
 }
