@@ -395,6 +395,7 @@ impl App {
 
     /// Play, with Recording precount's count-in when armed.
     pub(crate) fn play_counted_if_armed(&mut self) {
+        self.track_take_before_play();
         let bars = if self.state.rec.armed && Opt::Precount.on() { precount_bars() } else { 0 };
         self.start_playback_counted(bars);
         if bars > 0 && self.transport.playing() {
@@ -468,8 +469,8 @@ impl App {
             PItem::head("Recording filter"),
             it("Notes", Opt::Notes),
             it("Automation", Opt::Automation),
-            // Audio (FL: recording into mixer tracks, then the playlist): mixer tracks don't record yet; audio comes with
-            // One-click audio recording, into the playlist or the audio editor.
+            // Audio (FL: recording into mixer tracks, then the playlist): a mixer track with an input records whenever
+            // Record is armed and the playlist plays (`crate::one_click`); the check itself is not available yet.
             PItem::new("Audio", Cmd::Nothing).off(),
             PItem::head("Options"),
             it("Ask what to record", Opt::Ask),
